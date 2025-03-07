@@ -23,6 +23,13 @@ struct Args {
     whitelist: Vec<String>,
 }
 
+fn process_chat(line: String) -> Option<String> {
+    if !line.starts_with("***") {
+        return None;
+    }
+    Some(line)
+}
+
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
@@ -44,18 +51,36 @@ fn main() -> std::io::Result<()> {
     for (line_number, line) in reader.lines().enumerate() {
         let line = line?;
         progress.inc(1);
+
+        // sanity check for syntax
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 4 {
             progress.println(format!(
                 "Warning: Line {} does not have expected format: {}",
                 line_number + 1,
-                line,
+                line
             ));
             continue;
         }
-        let group = parts[3].strip_suffix(':').unwrap_or(parts[3]);
-        if args.whitelist.contains(&group.to_string()) {
-            writeln!(output_file, "{}", line)?;
+
+        let date = parts[0];
+        let time = parts[1];
+        let group = parts[3].strip_suffix(':').unwrap_or(parts[3]); // TODO:
+        let message = parts[4..].join(" ");
+
+        // check group whitelist
+        if !args.whitelist.contains(&group.to_string()) {
+            continue;
+        }
+
+        let processed_message = match group {
+            "chat" => process_chat(message),
+            _ => Some(message),
+        };
+
+        if let Some(message) = processed_message {
+            let output_line = format!("{} {} I {}: {}", date, time, group, message);
+            writeln!(output_file, "{}", output_line)?;
         }
     }
     progress.finish();
