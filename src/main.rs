@@ -1,5 +1,6 @@
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 
@@ -18,20 +19,54 @@ struct Args {
     #[arg(short, long)]
     output: String,
 
-    /// Whitelist of group names (e.g., ddnet,other). Use comma to separate multiple groups.
+    /// Whitelist of group names (e.g., ddnet,server,chat). Use comma to separate multiple groups.
     #[arg(short, long, value_delimiter = ',')]
     whitelist: Vec<String>,
 }
 
-fn process_chat(line: String) -> Option<String> {
-    if !line.starts_with("***") {
-        return None;
+struct Anonymizer {
+    player_names: HashSet<String>,
+    dropped_lines: usize,
+}
+
+impl Anonymizer {
+    fn new() -> Anonymizer {
+        Anonymizer {
+            player_names: HashSet::new(),
+            dropped_lines: 0,
+        }
     }
-    Some(line)
+
+    fn process_line(&mut self, group: &str, message: String) -> Option<String> {
+        match group {
+            "chat" => self.process_chat(message),
+            _ => Some(message),
+        }
+    }
+
+    fn process_chat(&mut self, message: String) -> Option<String> {
+        // chat messages dont start with ***, we drop those
+        if !message.starts_with("***") {
+            return None;
+        }
+
+        // extract player names from join messages
+        if message.contains("entered and joined the game") {
+            if let Some(start) = message.find('\'') {
+                if let Some(end) = message[start + 1..].find('\'') {
+                    let player_name = &message[start + 1..start + 1 + end];
+                    self.player_names.insert(player_name.to_string());
+                }
+            }
+        }
+
+        Some(message)
+    }
 }
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
+    let mut anon = Anonymizer::new();
 
     let count_file = File::open(&args.input)?;
     let count_reader = BufReader::new(count_file);
@@ -73,10 +108,7 @@ fn main() -> std::io::Result<()> {
             continue;
         }
 
-        let processed_message = match group {
-            "chat" => process_chat(message),
-            _ => Some(message),
-        };
+        let processed_message = anon.process_line(group, message);
 
         if let Some(message) = processed_message {
             let output_line = format!("{} {} I {}: {}", date, time, group, message);
