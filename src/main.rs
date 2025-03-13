@@ -27,18 +27,28 @@ struct Args {
     whitelist: Vec<String>,
 }
 
+struct LogParser {
+    players: Vec<Player>,
+    active_sessions: [Option<PlaySession>; 64],
+}
+
 struct Player {
-    name: Option<String>,
-    client_id: usize,
-    ip: String,
+    name: String,
+    sessions: Vec<PlaySession>,
 }
 
 struct PlaySession {
     start: DateTime<Utc>,
     duration: Option<Duration>,
     player_name: Option<String>,
-    client_id: usize,
     client_ip: String,
+    chat_messages: Vec<String>,
+    finishes: Vec<Finish>,
+}
+
+struct Finish {
+    map_name: String,
+    finish_time: Duration,
 }
 
 #[derive(Debug)]
@@ -48,14 +58,11 @@ struct Line {
     message: String,
 }
 
-struct LogParser {
-    players: [Option<Player>; MAX_PLAYERS],
-}
-
 impl LogParser {
     fn new() -> LogParser {
         LogParser {
-            players: [const { None }; MAX_PLAYERS],
+            players: Vec::new(),
+            active_sessions: [const { None }; MAX_PLAYERS],
         }
     }
 
