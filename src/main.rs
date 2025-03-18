@@ -2,12 +2,26 @@ use chrono::{Duration, NaiveDateTime};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 const MAX_PLAYERS: usize = 64;
+
+// TODO: move to some clean regex handler struct
+lazy_static! {
+    static ref SERVER_JOIN_REGEX: Regex = Regex::new(
+        r"(?m)^player has entered the game\. ClientID=(?P<client_id>\d+)\s+addr=<\{(?P<ip>\[[^\]]+\]|[^:]+):(?P<port>\d+)\}>\s+sixup=(?P<sixup>[01])$"
+    ).unwrap();
+    static ref GAME_LEAVE_REGEX: Regex = Regex::new(
+        r"(?m)^leave player='(?P<cid>\d+):(?P<name>[^']+)'$"
+    ).unwrap();
+    static ref CHAT_MESSAGE_REGEX: Regex = Regex::new(
+        r"(?m)^(?P<cid>\d+):(?P<unknown>[^:]+):(?P<name>[^:]+): (?P<message>.*)$"
+    ).unwrap();
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,7 +47,7 @@ struct LogParser {
     /// store all finished playsession for each player name
     sessions: HashMap<String, Vec<PlaySession>>,
 
-    active_sessions: [Option<TrackedPlaySession>; 64],
+    tracked_sessions: [Option<TrackedPlaySession>; 64],
 }
 
 #[derive(Debug)]
@@ -89,6 +103,14 @@ impl TrackedPlaySession {
             finishes: self.finishes,
         }
     }
+
+    fn set_or_validate_name(&mut self, name: &str) {
+        if let Some(ref set_name) = self.player_name {
+            assert_eq!(set_name, name);
+        } else {
+            self.player_name = Some(name.to_string());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -122,7 +144,7 @@ impl LogParser {
     pub fn new() -> LogParser {
         LogParser {
             sessions: HashMap::new(),
-            active_sessions: [const { None }; MAX_PLAYERS],
+            tracked_sessions: [const { None }; MAX_PLAYERS],
         }
     }
 
@@ -161,40 +183,26 @@ impl LogParser {
         })
     }
 
-    fn process_chat(&mut self, line: &Line) {
-        // chat messages dont start with ***, we drop those
-        if !line.message.starts_with("***") {
-            return;
-        }
-    }
-
     fn process_server(&mut self, line: &Line) {
-        let server_join_regex = Regex::new(
-        r"(?m)^player has entered the game\. ClientID=(?P<client_id>\d+)\s+addr=<\{(?P<ip>\[[^\]]+\]|[^:]+):(?P<port>\d+)\}>\s+sixup=(?P<sixup>[01])$"
-        ).unwrap();
-
-        if let Some(cap) = get_single_capture(&server_join_regex, &line.message) {
+        if let Some(cap) = get_single_capture(&SERVER_JOIN_REGEX, &line.message) {
             let cid: usize = cap["client_id"].parse::<usize>().unwrap();
             let ip = &cap["ip"];
 
             println!("start {}", cid);
 
             // there is no explicit signal for map changes, but implied by cid collisions
-            if self.active_sessions[cid].is_some() {
+            if self.tracked_sessions[cid].is_some() {
                 return; // skip TODO: check if there was a pending vote?
             }
 
             // start new session
-            self.active_sessions[cid] =
+            self.tracked_sessions[cid] =
                 Some(TrackedPlaySession::new(line.date_time, ip.to_string()));
         }
     }
 
     fn process_game(&mut self, line: &Line) {
-        let game_leave_regex =
-            Regex::new(r"(?m)^leave player='(?P<cid>\d+):(?P<name>[^']+)'$").unwrap();
-
-        if let Some(cap) = get_single_capture(&game_leave_regex, &line.message) {
+        if let Some(cap) = get_single_capture(&GAME_LEAVE_REGEX, &line.message) {
             // end active session
             let cid: usize = cap["cid"].parse::<usize>().unwrap();
             let name = &cap["name"];
@@ -202,10 +210,8 @@ impl LogParser {
             println!("end {}", cid);
 
             // add missing player name and end datetime to session
-            let session = self.active_sessions[cid]
-                .as_mut()
-                .expect(&format!("no active session for cid={}", cid));
-            session.player_name = Some(name.to_string());
+            let session = self.get_tracked_session(cid);
+            session.set_or_validate_name(&name);
             session.end = Some(line.date_time);
 
             // store session
@@ -213,10 +219,24 @@ impl LogParser {
         }
     }
 
+    fn process_chat(&mut self, line: &Line) {
+        if let Some(cap) = get_single_capture(&CHAT_MESSAGE_REGEX, &line.message) {
+            let cid: usize = cap["cid"].parse::<usize>().unwrap();
+            let name = &cap["name"];
+            let _unknown = &cap["unknown"];
+            let message = cap["message"].to_string();
+
+            let session = self.get_tracked_session(cid);
+            session.set_or_validate_name(&name);
+            session.chat_messages.push(message);
+        }
+    }
+
     fn finish_session(&mut self, cid: usize) {
-        let tracked_session = self.active_sessions[cid].take().unwrap();
+        let tracked_session = self.tracked_sessions[cid].take().unwrap();
         let session = tracked_session.finalize();
 
+        // TODO: clean player prefixes
         if !self.sessions.contains_key(&session.player_name) {
             self.sessions
                 .insert(session.player_name.to_owned(), Vec::new());
@@ -226,6 +246,14 @@ impl LogParser {
             .get_mut(&session.player_name)
             .unwrap()
             .push(session);
+    }
+
+    fn get_tracked_session(&mut self, cid: usize) -> &mut TrackedPlaySession {
+        let session = self.tracked_sessions[cid]
+            .as_mut()
+            .expect(&format!("no tracked session for cid={}", cid));
+
+        session
     }
 }
 
@@ -242,7 +270,7 @@ fn main() -> std::io::Result<()> {
 
     for (line_number, line) in reader.lines().enumerate() {
         let line = line?;
-        // println!("{}", &line);
+        println!("{}", &line);
         println!("{}: {}", line_number, line);
         parser.process_line(&line);
 
@@ -250,7 +278,7 @@ fn main() -> std::io::Result<()> {
     }
 
     dbg!(parser.sessions);
-    dbg!(parser.active_sessions);
+    dbg!(parser.tracked_sessions);
 
     Ok(())
 }
