@@ -1,4 +1,4 @@
-use chrono::{Duration, NaiveDateTime};
+use chrono::{NaiveDateTime, TimeDelta};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -7,19 +7,32 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::time::Duration;
 
 const MAX_PLAYERS: usize = 64;
 
 // TODO: move to some clean regex handler struct
 lazy_static! {
     static ref SERVER_JOIN_REGEX: Regex = Regex::new(
-        r"(?m)^player has entered the game\. ClientID=(?P<client_id>\d+)\s+addr=<\{(?P<ip>\[[^\]]+\]|[^:]+):(?P<port>\d+)\}>\s+sixup=(?P<sixup>[01])$"
+        r"^player has entered the game\. ClientID=(?P<client_id>\d+)\s+addr=<\{(?P<ip>\[[^\]]+\]|[^:]+):(?P<port>\d+)\}>\s+sixup=(?P<sixup>[01])$"
     ).unwrap();
     static ref GAME_LEAVE_REGEX: Regex = Regex::new(
-        r"(?m)^leave player='(?P<cid>\d+):(?P<name>[^']+)'$"
+        r"^leave player='(?P<cid>\d+):(?P<name>[^']+)'$"
     ).unwrap();
     static ref CHAT_MESSAGE_REGEX: Regex = Regex::new(
-        r"(?m)^(?P<cid>\d+):(?P<unknown>[^:]+):(?P<name>[^:]+): (?P<message>.*)$"
+        r"^(?P<cid>\d+):(?P<unknown>[^:]+):(?P<name>[^:]+): (?P<message>.*)$"
+    ).unwrap();
+    static ref CHAT_FINISH_REGEX: Regex = Regex::new(
+        r"^\*\*\*\s(?P<name>\S+)\sfinished in:\s(?P<minutes>\d+)\sminute\(s\)\s(?P<seconds>[\d.]+)\ssecond\(s\)$"
+    ).unwrap();
+    static ref DDNET_VERSION_REGEX: Regex = Regex::new(
+        r"^cid=(?P<cid>\d+)\sversion=(?P<version>\d+)$"
+    ).unwrap();
+    static ref CHAT_JOIN_REGEX: Regex = Regex::new(
+        r"^\*\*\*\s'(?P<name>[^']+)' entered and joined the game$"
+    ).unwrap();
+    static ref CHAT_RENAME_REGEX: Regex = Regex::new(
+        r"^\*\*\*\s'(?P<old>[^']+)' changed name to '(?P<new>[^']+)'$"
     ).unwrap();
 }
 
@@ -47,7 +60,11 @@ struct LogParser {
     /// store all finished playsession for each player name
     sessions: HashMap<String, Vec<PlaySession>>,
 
+    /// currently tracked play sessions for all possible CID's
     tracked_sessions: [Option<TrackedPlaySession>; 64],
+
+    /// last joined CID, used for matching player names to CID
+    last_join_cid: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -64,17 +81,19 @@ struct TrackedPlaySession {
     client_ip: String,
     chat_messages: Vec<String>,
     finishes: Vec<Finish>,
+    version: Option<String>,
 }
 
 #[derive(Debug)]
 struct PlaySession {
     start: NaiveDateTime,
     end: NaiveDateTime,
-    duration: Duration,
+    duration: TimeDelta,
     player_name: String,
     client_ip: String,
     chat_messages: Vec<String>,
     finishes: Vec<Finish>,
+    version: String,
 }
 
 impl TrackedPlaySession {
@@ -86,6 +105,7 @@ impl TrackedPlaySession {
             client_ip,
             chat_messages: Vec::new(),
             finishes: Vec::new(),
+            version: None,
         }
     }
 
@@ -93,6 +113,7 @@ impl TrackedPlaySession {
         let end = self.end.expect("end not set");
         let player_name = self.player_name.expect("name not set");
         let duration = end - self.start;
+        let version = self.version.expect("version not set");
         PlaySession {
             start: self.start,
             end,
@@ -101,12 +122,20 @@ impl TrackedPlaySession {
             client_ip: self.client_ip,
             chat_messages: self.chat_messages,
             finishes: self.finishes,
+            version,
         }
     }
 
     fn set_or_validate_name(&mut self, name: &str) {
-        if let Some(ref set_name) = self.player_name {
-            assert_eq!(set_name, name);
+        if let Some(ref current_name) = self.player_name {
+            if current_name == name {
+                return;
+            }
+
+            panic!(
+                "Name mismatch: currently known name is '{}', now '{}'",
+                current_name, name
+            );
         } else {
             self.player_name = Some(name.to_string());
         }
@@ -115,7 +144,7 @@ impl TrackedPlaySession {
 
 #[derive(Debug)]
 struct Finish {
-    map_name: String,
+    // map_name: String,
     finish_time: Duration,
 }
 
@@ -145,6 +174,7 @@ impl LogParser {
         LogParser {
             sessions: HashMap::new(),
             tracked_sessions: [const { None }; MAX_PLAYERS],
+            last_join_cid: None,
         }
     }
 
@@ -154,6 +184,7 @@ impl LogParser {
                 "server" => self.process_server(&line),
                 "chat" => self.process_chat(&line),
                 "game" => self.process_game(&line),
+                "ddnet" => self.process_ddnet(&line),
                 _ => {}
             };
         }
@@ -190,6 +221,9 @@ impl LogParser {
 
             println!("start {}", cid);
 
+            // remember last joined CID
+            self.last_join_cid = Some(cid);
+
             // there is no explicit signal for map changes, but implied by cid collisions
             if self.tracked_sessions[cid].is_some() {
                 return; // skip TODO: check if there was a pending vote?
@@ -223,12 +257,52 @@ impl LogParser {
         if let Some(cap) = get_single_capture(&CHAT_MESSAGE_REGEX, &line.message) {
             let cid: usize = cap["cid"].parse::<usize>().unwrap();
             let name = &cap["name"];
-            let _unknown = &cap["unknown"];
+            let _unknown = &cap["unknown"]; // TODO: what is this?
             let message = cap["message"].to_string();
 
             let session = self.get_tracked_session(cid);
             session.set_or_validate_name(&name);
             session.chat_messages.push(message);
+        } else if let Some(cap) = get_single_capture(&CHAT_FINISH_REGEX, &line.message) {
+            dbg!(&cap);
+            let name = &cap["name"];
+            let secs = cap["seconds"].parse::<f32>().unwrap();
+            let mins = cap["minutes"].parse::<f32>().unwrap();
+
+            let cid = self.get_cid(&name);
+            let session = self.get_tracked_session(cid);
+
+            let finish = Finish {
+                finish_time: Duration::from_secs_f32((mins * 60.0) + secs),
+            };
+
+            session.finishes.push(finish);
+        } else if let Some(cap) = get_single_capture(&CHAT_JOIN_REGEX, &line.message) {
+            let name = &cap["name"];
+
+            // current assumption is that a chat join message with player name follows
+            // a server join message of SAME PLAYER with CID. I'll use this for matching.
+            let cid = self.last_join_cid.unwrap();
+            let session = self.get_tracked_session(cid);
+
+            dbg!(&name, &cid, &session);
+            session.set_or_validate_name(&name);
+        } else if let Some(cap) = get_single_capture(&CHAT_RENAME_REGEX, &line.message) {
+            let old_name = &cap["old"];
+            let new_name = &cap["new"];
+
+            let cid = self.get_cid(&old_name);
+            let session = self.get_tracked_session(cid);
+            session.player_name = Some(new_name.to_string()); // overwrite! TODO: track all names?
+        }
+    }
+
+    fn process_ddnet(&mut self, line: &Line) {
+        if let Some(cap) = get_single_capture(&DDNET_VERSION_REGEX, &line.message) {
+            let cid: usize = cap["cid"].parse::<usize>().unwrap();
+            let version = cap["version"].to_string();
+
+            self.get_tracked_session(cid).version = Some(version);
         }
     }
 
@@ -254,6 +328,17 @@ impl LogParser {
             .expect(&format!("no tracked session for cid={}", cid));
 
         session
+    }
+
+    fn get_cid(&self, player_name: &str) -> usize {
+        self.tracked_sessions
+            .iter()
+            .position(|tracked_session| {
+                tracked_session.as_ref().map_or(false, |s| {
+                    s.player_name.as_ref().map_or(false, |n| n == player_name)
+                })
+            })
+            .expect(&format!("No tracked session found for '{}'", player_name))
     }
 }
 
