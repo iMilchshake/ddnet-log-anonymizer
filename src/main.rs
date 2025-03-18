@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, NaiveDateTime};
+use chrono::{Duration, NaiveDateTime};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -33,34 +33,60 @@ struct LogParser {
     /// store all finished playsession for each player name
     sessions: HashMap<String, Vec<PlaySession>>,
 
-    active_sessions: [Option<PlaySession>; 64],
+    active_sessions: [Option<TrackedPlaySession>; 64],
 }
 
 #[derive(Debug)]
 struct Player {
     name: String,
-    sessions: Vec<PlaySession>,
+    sessions: Vec<TrackedPlaySession>,
 }
 
 #[derive(Debug)]
-struct PlaySession {
+struct TrackedPlaySession {
     start: NaiveDateTime,
-    duration: Option<Duration>,
+    end: Option<NaiveDateTime>,
     player_name: Option<String>,
     client_ip: String,
     chat_messages: Vec<String>,
     finishes: Vec<Finish>,
 }
 
-impl PlaySession {
-    fn new(start: NaiveDateTime, client_ip: String) -> PlaySession {
-        PlaySession {
+#[derive(Debug)]
+struct PlaySession {
+    start: NaiveDateTime,
+    end: NaiveDateTime,
+    duration: Duration,
+    player_name: String,
+    client_ip: String,
+    chat_messages: Vec<String>,
+    finishes: Vec<Finish>,
+}
+
+impl TrackedPlaySession {
+    fn new(start: NaiveDateTime, client_ip: String) -> TrackedPlaySession {
+        TrackedPlaySession {
             start,
-            duration: None,
+            end: None,
             player_name: None,
             client_ip,
             chat_messages: Vec::new(),
             finishes: Vec::new(),
+        }
+    }
+
+    fn finalize(self) -> PlaySession {
+        let end = self.end.expect("end not set");
+        let player_name = self.player_name.expect("name not set");
+        let duration = end - self.start;
+        PlaySession {
+            start: self.start,
+            end,
+            duration,
+            player_name,
+            client_ip: self.client_ip,
+            chat_messages: self.chat_messages,
+            finishes: self.finishes,
         }
     }
 }
@@ -159,7 +185,8 @@ impl LogParser {
             }
 
             // start new session
-            self.active_sessions[cid] = Some(PlaySession::new(line.date_time, ip.to_string()));
+            self.active_sessions[cid] =
+                Some(TrackedPlaySession::new(line.date_time, ip.to_string()));
         }
     }
 
@@ -174,11 +201,12 @@ impl LogParser {
 
             println!("end {}", cid);
 
-            // add missing player name to session
+            // add missing player name and end datetime to session
             let session = self.active_sessions[cid]
                 .as_mut()
                 .expect(&format!("no active session for cid={}", cid));
             session.player_name = Some(name.to_string());
+            session.end = Some(line.date_time);
 
             // store session
             self.finish_session(cid);
@@ -186,13 +214,18 @@ impl LogParser {
     }
 
     fn finish_session(&mut self, cid: usize) {
-        let session = self.active_sessions[cid].take().unwrap();
-        let name = session.player_name.as_ref().expect("player name not set!");
+        let tracked_session = self.active_sessions[cid].take().unwrap();
+        let session = tracked_session.finalize();
 
-        if !self.sessions.contains_key(name) {
-            self.sessions.insert(name.to_string(), Vec::new());
+        if !self.sessions.contains_key(&session.player_name) {
+            self.sessions
+                .insert(session.player_name.to_owned(), Vec::new());
         }
-        self.sessions.get_mut(name).unwrap().push(session);
+
+        self.sessions
+            .get_mut(&session.player_name)
+            .unwrap()
+            .push(session);
     }
 }
 
