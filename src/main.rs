@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -21,8 +21,8 @@ struct Args {
     input: String,
 
     /// Output log file path
-    #[arg(short, long)]
-    output: String,
+    // #[arg(short, long)]
+    // output: String,
 
     /// Whitelist of group names (e.g., ddnet,server,chat). Use comma to separate multiple groups.
     #[arg(short, long, value_delimiter = ',')]
@@ -44,7 +44,7 @@ struct Player {
 
 #[derive(Debug)]
 struct PlaySession {
-    start: DateTime<Utc>,
+    start: NaiveDateTime,
     duration: Option<Duration>,
     player_name: Option<String>,
     client_ip: String,
@@ -53,7 +53,7 @@ struct PlaySession {
 }
 
 impl PlaySession {
-    fn new(start: DateTime<Utc>, client_ip: String) -> PlaySession {
+    fn new(start: NaiveDateTime, client_ip: String) -> PlaySession {
         PlaySession {
             start,
             duration: None,
@@ -73,7 +73,7 @@ struct Finish {
 
 #[derive(Debug)]
 struct Line {
-    date_time: DateTime<Utc>,
+    date_time: NaiveDateTime,
     group: String,
     message: String,
 }
@@ -119,21 +119,17 @@ impl LogParser {
             return None;
         }
 
-        let group = parts[3].strip_suffix(':').unwrap_or(parts[3]); // TODO:
+        let group = parts[3].strip_suffix(':').unwrap_or(parts[3]);
         let message = parts[4..].join(" ");
-
-        // 2024-08-08 20:48:33 I sql: SQLite statement: INSERT OR IGNORE INTO record_saves(Savegame, Map, Code, Timestamp, Server, SaveID, DDNet7) VALUES ('2	1	0	0	0
-
         let date_time_string = format!("{} {}", parts[0], parts[1]);
 
-        // there are weird SQL log lines that span across multiple lines. For now their parsing
-        // will fail, in future they should be explicitly dealt with.
-        let naive_date_time =
+        // there are weird SQL log lines that span across multiple lines. For now,
+        // parsing them will fail. In future they should be explicitly dealt with.
+        let date_time =
             NaiveDateTime::parse_from_str(&date_time_string, "%Y-%m-%d %H:%M:%S").ok()?;
-        let utc_date_time: DateTime<Utc> = Utc.from_utc_datetime(&naive_date_time);
 
         Some(Line {
-            date_time: utc_date_time,
+            date_time,
             group: group.to_string(),
             message,
         })
@@ -159,8 +155,7 @@ impl LogParser {
 
             // there is no explicit signal for map changes, but implied by cid collisions
             if self.active_sessions[cid].is_some() {
-                dbg!("map change?", cid);
-                return; // skip
+                return; // skip TODO: check if there was a pending vote?
             }
 
             // start new session
