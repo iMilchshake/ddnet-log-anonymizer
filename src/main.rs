@@ -1,5 +1,4 @@
 use chrono::{NaiveDateTime, TimeDelta};
-
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
@@ -10,6 +9,9 @@ use std::io::{BufRead, BufReader};
 use std::panic;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
+
+use env_logger;
+use log::{debug, error, info, trace, warn};
 
 const MAX_PLAYERS: usize = 64;
 
@@ -259,15 +261,16 @@ impl LogParser {
             let cid: usize = cap["client_id"].parse::<usize>().unwrap();
             let ip = &cap["ip"];
 
-            println!("start {}", cid);
-
             // remember last joined CID
             self.last_join_cid = Some(cid);
 
             // there is no explicit signal for map changes, but implied by cid collisions
             if self.tracked_sessions[cid].is_some() {
+                debug!("re-join cid={}", cid);
                 return; // skip TODO: check if there was a pending vote?
             }
+
+            debug!("join cid={}", cid);
 
             // start new session
             self.tracked_sessions[cid] =
@@ -281,7 +284,7 @@ impl LogParser {
             let cid: usize = cap["cid"].parse::<usize>().unwrap();
             let name = &cap["name"];
 
-            println!("end {}", cid);
+            debug!("leave cid={}", cid);
 
             // add end datetime to session and validate player name
             let session = self.get_tracked_session(cid);
@@ -307,7 +310,6 @@ impl LogParser {
             session.set_or_validate_name(&name);
             session.chat_messages.push(message);
         } else if let Some(cap) = get_single_capture(&CHAT_FINISH_REGEX, &line.message) {
-            dbg!(&cap);
             let name = &cap["name"];
             let secs = cap["seconds"].parse::<f32>().unwrap();
             let mins = cap["minutes"].parse::<f32>().unwrap();
@@ -330,11 +332,13 @@ impl LogParser {
                 // so we migrate old_cid -> new_cid
                 let old_session = self.tracked_sessions[old_cid].take();
                 self.tracked_sessions[new_cid] = old_session;
+                debug!("migrating {} -> {}", old_cid, new_cid);
             } else {
                 // current player name is not tracked yet so we use the previous
                 // server join message for determining the correct new CID.
                 let session = &mut self.get_tracked_session(new_cid);
                 session.set_or_validate_name(&name);
+                debug!("new join -> {}", new_cid);
             }
         } else if let Some(cap) = get_single_capture(&CHAT_RENAME_REGEX, &line.message) {
             let old_name = &cap["old"];
@@ -355,15 +359,13 @@ impl LogParser {
 
             // new map was generated (TODO: most likely... im not checking for "DONE" yet xd)
 
-            dbg!(&gen_cfg, &map_cfg);
-
             // cleanup timeouted connections..
             for cid in 0..MAX_PLAYERS {
                 if self.tracked_sessions[cid]
                     .as_ref()
                     .is_some_and(|s| s.timeout)
                 {
-                    println!("cleanup timeouted player cid={}", cid);
+                    debug!("cleanup timeouted player cid={}", cid);
                     self.finish_session(cid);
                 }
             }
@@ -389,10 +391,11 @@ impl LogParser {
                 return;
             }
 
+            debug!("server start, cleaning players");
             for cid in 0..MAX_PLAYERS {
                 // set missing datetime
                 if let Some(ref mut tracked_session) = &mut self.tracked_sessions[cid] {
-                    println!("finishing player cid={}", cid);
+                    debug!("finishing player cid={}", cid);
                     // use last datetime before restart
                     if tracked_session.end.is_none() {
                         tracked_session.end = self.last_line_datetime.clone();
@@ -438,6 +441,10 @@ impl LogParser {
 }
 
 fn main() -> std::io::Result<()> {
+    env_logger::builder()
+        .format_timestamp(None)
+        .format_target(false)
+        .init();
     let args = Args::parse();
     let mut parser = LogParser::new();
 
@@ -450,7 +457,7 @@ fn main() -> std::io::Result<()> {
 
     for (line_number, line) in reader.lines().enumerate() {
         let line = line?;
-        println!("{}: {}", line_number, line);
+        trace!("{}: {}", line_number, line);
 
         let result = catch_unwind(AssertUnwindSafe(|| {
             parser.process_line(&line);
@@ -458,7 +465,7 @@ fn main() -> std::io::Result<()> {
         if let Err(err) = result {
             // dbg!(parser.sessions);
             dbg!(parser.tracked_sessions);
-            println!("crashed D:");
+            error!("crashed D:");
             panic::resume_unwind(err);
         }
     }
