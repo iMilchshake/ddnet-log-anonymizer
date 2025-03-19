@@ -7,6 +7,8 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::panic;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 const MAX_PLAYERS: usize = 64;
@@ -310,7 +312,7 @@ impl LogParser {
             let secs = cap["seconds"].parse::<f32>().unwrap();
             let mins = cap["minutes"].parse::<f32>().unwrap();
 
-            let cid = self.get_cid(&name);
+            let cid = self.get_cid(&name).unwrap();
             let session = self.get_tracked_session(cid);
 
             let finish = Finish {
@@ -320,24 +322,30 @@ impl LogParser {
             session.finishes.push(finish);
         } else if let Some(cap) = get_single_capture(&CHAT_JOIN_REGEX, &line.message) {
             let name = &cap["name"];
+            let new_cid = self.last_join_cid.unwrap();
 
-            // current assumption is that a chat join message with player name follows
-            // a server join message of SAME PLAYER with CID. I'll use this for matching.
-            let cid = self.last_join_cid.unwrap();
-            let session = self.get_tracked_session(cid);
-
-            dbg!(&name, &cid, &session);
-            session.set_or_validate_name(&name);
+            if let Some(old_cid) = self.get_cid(name) {
+                // player name is already tracked for another cid. This can happen if a player
+                // re-connects while the server map changes. So a leave is never triggered.
+                // so we migrate old_cid -> new_cid
+                let old_session = self.tracked_sessions[old_cid].take();
+                self.tracked_sessions[new_cid] = old_session;
+            } else {
+                // current player name is not tracked yet so we use the previous
+                // server join message for determining the correct new CID.
+                let session = &mut self.get_tracked_session(new_cid);
+                session.set_or_validate_name(&name);
+            }
         } else if let Some(cap) = get_single_capture(&CHAT_RENAME_REGEX, &line.message) {
             let old_name = &cap["old"];
             let new_name = &cap["new"];
 
-            let cid = self.get_cid(&old_name);
+            let cid = self.get_cid(&old_name).unwrap();
             let session = self.get_tracked_session(cid);
             session.player_name = Some(new_name.to_string()); // overwrite! TODO: track all names?
         } else if let Some(cap) = get_single_capture(&CHAT_TIMEOUT_REGEX, &line.message) {
             let name = &cap["name"];
-            let cid = self.get_cid(&name);
+            let cid = self.get_cid(&name).unwrap();
             let session = self.get_tracked_session(cid);
             session.end = Some(line.date_time); // set end in case timeout never reconnects
             session.timeout = true;
@@ -419,15 +427,13 @@ impl LogParser {
         session
     }
 
-    fn get_cid(&self, player_name: &str) -> usize {
-        self.tracked_sessions
-            .iter()
-            .position(|tracked_session| {
-                tracked_session.as_ref().map_or(false, |s| {
-                    s.player_name.as_ref().map_or(false, |n| n == player_name)
-                })
+    fn get_cid(&self, player_name: &str) -> Option<usize> {
+        self.tracked_sessions.iter().position(|tracked_session| {
+            tracked_session.as_ref().map_or(false, |s| {
+                s.player_name.as_ref().map_or(false, |n| n == player_name)
             })
-            .expect(&format!("No tracked session found for '{}'", player_name))
+        })
+        // .expect(&format!("No tracked session found for '{}'", player_name))
     }
 }
 
@@ -445,9 +451,16 @@ fn main() -> std::io::Result<()> {
     for (line_number, line) in reader.lines().enumerate() {
         let line = line?;
         println!("{}: {}", line_number, line);
-        parser.process_line(&line);
 
-        // println!("\n");
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            parser.process_line(&line);
+        }));
+        if let Err(err) = result {
+            // dbg!(parser.sessions);
+            dbg!(parser.tracked_sessions);
+            println!("crashed D:");
+            panic::resume_unwind(err);
+        }
     }
 
     dbg!(parser.sessions);
