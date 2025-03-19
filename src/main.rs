@@ -34,6 +34,15 @@ lazy_static! {
     static ref CHAT_RENAME_REGEX: Regex = Regex::new(
         r"^\*\*\*\s'(?P<old>[^']+)' changed name to '(?P<new>[^']+)'$"
     ).unwrap();
+
+    static ref ENGINE_SERVER_START_REGEX: Regex = Regex::new(
+        r"^running on (?P<platform>\S+)$"
+    ).unwrap();
+
+    // TODO: how to make this optional?
+    static ref CHAT_MAPGEN_INFO_REGEX: Regex = Regex::new(
+        r#".*\[GEN\] Generating.*gen_cfg="(?P<gen_cfg>[^"]+)".*map_cfg="(?P<map_cfg>[^"]+)".*"#
+    ).unwrap();
 }
 
 #[derive(Parser, Debug)]
@@ -65,6 +74,11 @@ struct LogParser {
 
     /// last joined CID, used for matching player names to CID
     last_join_cid: Option<usize>,
+
+    /// track which CIDs are currently in timeout state
+    cid_timeout: [bool; 64],
+
+    last_line_datetime: Option<NaiveDateTime>,
 }
 
 #[derive(Debug)]
@@ -132,6 +146,17 @@ impl TrackedPlaySession {
                 return;
             }
 
+            // allow name changes from "(1)name" -> "name"
+            if current_name.starts_with('(') {
+                if let Some(end) = current_name.find(')') {
+                    let base_name = current_name[end + 1..].trim();
+                    if base_name == name {
+                        self.player_name = Some(name.to_string());
+                        return;
+                    }
+                }
+            }
+
             panic!(
                 "Name mismatch: currently known name is '{}', now '{}'",
                 current_name, name
@@ -175,6 +200,8 @@ impl LogParser {
             sessions: HashMap::new(),
             tracked_sessions: [const { None }; MAX_PLAYERS],
             last_join_cid: None,
+            cid_timeout: [false; MAX_PLAYERS],
+            last_line_datetime: None,
         }
     }
 
@@ -185,8 +212,12 @@ impl LogParser {
                 "chat" => self.process_chat(&line),
                 "game" => self.process_game(&line),
                 "ddnet" => self.process_ddnet(&line),
+                "engine" => self.process_engine(&line),
                 _ => {}
             };
+
+            // finished processing, now update last seen datetime
+            self.last_line_datetime = Some(line.date_time);
         }
     }
 
@@ -243,7 +274,7 @@ impl LogParser {
 
             println!("end {}", cid);
 
-            // add missing player name and end datetime to session
+            // add end datetime to session and validate player name
             let session = self.get_tracked_session(cid);
             session.set_or_validate_name(&name);
             session.end = Some(line.date_time);
@@ -306,6 +337,28 @@ impl LogParser {
         }
     }
 
+    fn process_engine(&mut self, line: &Line) {
+        if let Some(cap) = get_single_capture(&ENGINE_SERVER_START_REGEX, &line.message) {
+            // server is restarting so we need to cleanup all running playsessions
+
+            // if there is no previously seen datetime it means that this is the first line of
+            // the serverlog, so nothing needs to be cleaned up, just skip
+            if self.last_line_datetime.is_none() {
+                return;
+            }
+
+            for cid in 0..MAX_PLAYERS {
+                // set missing datetime
+                if let Some(ref mut tracked_session) = &mut self.tracked_sessions[cid] {
+                    println!("finishing player cid={}", cid);
+                    // use last datetime before restart
+                    tracked_session.end = self.last_line_datetime.clone();
+                    self.finish_session(cid);
+                }
+            }
+        }
+    }
+
     fn finish_session(&mut self, cid: usize) {
         let tracked_session = self.tracked_sessions[cid].take().unwrap();
         let session = tracked_session.finalize();
@@ -355,7 +408,6 @@ fn main() -> std::io::Result<()> {
 
     for (line_number, line) in reader.lines().enumerate() {
         let line = line?;
-        println!("{}", &line);
         println!("{}: {}", line_number, line);
         parser.process_line(&line);
 
