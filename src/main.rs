@@ -14,6 +14,7 @@ use env_logger;
 use log::{debug, error, info, trace, warn};
 
 const MAX_PLAYERS: usize = 64;
+const NAME_LIMIT: usize = 15;
 
 // TODO: move to some clean regex handler struct
 lazy_static! {
@@ -105,6 +106,9 @@ struct TrackedPlaySession {
     finishes: Vec<Finish>,
     version: Option<String>,
     timeout: bool,
+
+    /// tracks if player is currently connected. Relevant for players leaving during a map change.
+    connected: bool,
 }
 
 #[derive(Debug)]
@@ -131,6 +135,7 @@ impl TrackedPlaySession {
             finishes: Vec::new(),
             version: None,
             timeout: false,
+            connected: true,
         }
     }
 
@@ -159,10 +164,14 @@ impl TrackedPlaySession {
             }
 
             // allow name changes from "(1)name" -> "name"
+            // we also need to respect the maximum name limit..
             if current_name.starts_with('(') {
                 if let Some(end) = current_name.find(')') {
-                    let base_name = current_name[end + 1..].trim();
-                    if base_name == name {
+                    let player_name = current_name[end + 1..].trim();
+                    let prefix = &current_name[..end + 1];
+                    let allowed_length = NAME_LIMIT.saturating_sub(prefix.len());
+                    let truncated_player_name = &name[..allowed_length.min(name.len())];
+                    if player_name == truncated_player_name {
                         self.player_name = Some(name.to_string());
                         return;
                     }
@@ -259,20 +268,33 @@ impl LogParser {
     fn process_server(&mut self, line: &Line) {
         if let Some(cap) = get_single_capture(&SERVER_JOIN_REGEX, &line.message) {
             let cid: usize = cap["client_id"].parse::<usize>().unwrap();
+            self.last_join_cid = Some(cid); // remember joined CID
             let ip = &cap["ip"];
 
-            // remember last joined CID
-            self.last_join_cid = Some(cid);
+            // its possible that a new client connects with a CID that is already tracked.
+            // this can for example happen on map change. In this case we check if the IPs match.
+            if let Some(tracked_session) = &mut self.tracked_sessions[cid] {
+                // first we ensure that tracked connection is not actively connected
+                assert!(!tracked_session.connected);
 
-            // there is no explicit signal for map changes, but implied by cid collisions
-            if self.tracked_sessions[cid].is_some() {
-                debug!("re-join cid={}", cid);
-                return; // skip TODO: check if there was a pending vote?
+                // then we check if IPs match, if yes we interpret the server join as a re-join and
+                // continue the tracked session for this CID
+                if tracked_session.client_ip == ip {
+                    debug!("re-join cid={}", cid);
+                    tracked_session.connected = true;
+                    tracked_session.end = None; // reset end datetime, as player reconnected
+                    return; // skip the following
+                }
+
+                // if IPs dont match it seems like a new person joined and received a tracked
+                // CID for which the server didnt explicitly log a leave. But as its unconnected
+                // its safe to assume that the client disconnected. Therefore, we finish the
+                // currently recorded session and create a new one for the new join.
+                self.finish_session(cid);
             }
 
+            // new CID -> start new session!
             debug!("join cid={}", cid);
-
-            // start new session
             self.tracked_sessions[cid] =
                 Some(TrackedPlaySession::new(line.date_time, ip.to_string()));
         }
@@ -359,14 +381,17 @@ impl LogParser {
 
             // new map was generated (TODO: most likely... im not checking for "DONE" yet xd)
 
-            // cleanup timeouted connections..
             for cid in 0..MAX_PLAYERS {
-                if self.tracked_sessions[cid]
-                    .as_ref()
-                    .is_some_and(|s| s.timeout)
-                {
-                    debug!("cleanup timeouted player cid={}", cid);
-                    self.finish_session(cid);
+                if let Some(tracked_session) = &mut self.tracked_sessions[cid] {
+                    // set all connections to not connected, remember end datetime
+                    tracked_session.connected = false;
+                    tracked_session.end = Some(line.date_time);
+
+                    // and completely cleanup timeouted connections..
+                    if tracked_session.timeout {
+                        debug!("cleanup timeouted player cid={}", cid);
+                        self.finish_session(cid);
+                    }
                 }
             }
         }
