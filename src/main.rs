@@ -34,6 +34,9 @@ lazy_static! {
     static ref CHAT_RENAME_REGEX: Regex = Regex::new(
         r"^\*\*\*\s'(?P<old>[^']+)' changed name to '(?P<new>[^']+)'$"
     ).unwrap();
+    static ref CHAT_TIMEOUT_REGEX: Regex = Regex::new(
+        r"^\*\*\*\s'(?P<name>[^']+)' would have timed out, but can use timeout protection now$"
+    ).unwrap();
 
     static ref ENGINE_SERVER_START_REGEX: Regex = Regex::new(
         r"^running on (?P<platform>\S+)$"
@@ -76,8 +79,9 @@ struct LogParser {
     last_join_cid: Option<usize>,
 
     /// track which CIDs are currently in timeout state
-    cid_timeout: [bool; 64],
+    // cid_timeout: [bool; 64],
 
+    /// TODO: DOC
     last_line_datetime: Option<NaiveDateTime>,
 }
 
@@ -96,6 +100,7 @@ struct TrackedPlaySession {
     chat_messages: Vec<String>,
     finishes: Vec<Finish>,
     version: Option<String>,
+    timeout: bool,
 }
 
 #[derive(Debug)]
@@ -108,6 +113,7 @@ struct PlaySession {
     chat_messages: Vec<String>,
     finishes: Vec<Finish>,
     version: String,
+    timeout: bool,
 }
 
 impl TrackedPlaySession {
@@ -120,6 +126,7 @@ impl TrackedPlaySession {
             chat_messages: Vec::new(),
             finishes: Vec::new(),
             version: None,
+            timeout: false,
         }
     }
 
@@ -137,6 +144,7 @@ impl TrackedPlaySession {
             chat_messages: self.chat_messages,
             finishes: self.finishes,
             version,
+            timeout: self.timeout,
         }
     }
 
@@ -200,7 +208,6 @@ impl LogParser {
             sessions: HashMap::new(),
             tracked_sessions: [const { None }; MAX_PLAYERS],
             last_join_cid: None,
-            cid_timeout: [false; MAX_PLAYERS],
             last_line_datetime: None,
         }
     }
@@ -277,7 +284,10 @@ impl LogParser {
             // add end datetime to session and validate player name
             let session = self.get_tracked_session(cid);
             session.set_or_validate_name(&name);
-            session.end = Some(line.date_time);
+            if session.end.is_none() {
+                // we dont overwrite if aleady set (by timeout)
+                session.end = Some(line.date_time);
+            }
 
             // store session
             self.finish_session(cid);
@@ -325,6 +335,30 @@ impl LogParser {
             let cid = self.get_cid(&old_name);
             let session = self.get_tracked_session(cid);
             session.player_name = Some(new_name.to_string()); // overwrite! TODO: track all names?
+        } else if let Some(cap) = get_single_capture(&CHAT_TIMEOUT_REGEX, &line.message) {
+            let name = &cap["name"];
+            let cid = self.get_cid(&name);
+            let session = self.get_tracked_session(cid);
+            session.end = Some(line.date_time); // set end in case timeout never reconnects
+            session.timeout = true;
+        } else if let Some(cap) = get_single_capture(&CHAT_MAPGEN_INFO_REGEX, &line.message) {
+            let gen_cfg = &cap["gen_cfg"];
+            let map_cfg = &cap["map_cfg"];
+
+            // new map was generated (TODO: most likely... im not checking for "DONE" yet xd)
+
+            dbg!(&gen_cfg, &map_cfg);
+
+            // cleanup timeouted connections..
+            for cid in 0..MAX_PLAYERS {
+                if self.tracked_sessions[cid]
+                    .as_ref()
+                    .is_some_and(|s| s.timeout)
+                {
+                    println!("cleanup timeouted player cid={}", cid);
+                    self.finish_session(cid);
+                }
+            }
         }
     }
 
@@ -352,7 +386,9 @@ impl LogParser {
                 if let Some(ref mut tracked_session) = &mut self.tracked_sessions[cid] {
                     println!("finishing player cid={}", cid);
                     // use last datetime before restart
-                    tracked_session.end = self.last_line_datetime.clone();
+                    if tracked_session.end.is_none() {
+                        tracked_session.end = self.last_line_datetime.clone();
+                    }
                     self.finish_session(cid);
                 }
             }
