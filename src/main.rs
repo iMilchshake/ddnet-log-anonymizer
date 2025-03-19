@@ -178,13 +178,13 @@ impl TrackedPlaySession {
                 }
             }
 
-            panic!(
+            warn!(
                 "Name mismatch: currently known name is '{}', now '{}'",
                 current_name, name
             );
-        } else {
-            self.player_name = Some(name.to_string());
         }
+
+        self.player_name = Some(name.to_string());
     }
 }
 
