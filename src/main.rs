@@ -47,6 +47,9 @@ lazy_static! {
     static ref ENGINE_SERVER_START_REGEX: Regex = Regex::new(
         r"^running on (?P<platform>\S+)$"
     ).unwrap();
+    static ref SERVER_RCON_BAN_REGEX: Regex = Regex::new(
+        r"^ClientID=(?P<cid>\d+)\s+rcon='ban\s+(?P<cid_ban>\d+)\s+(?P<duration>\d+)\s+(?P<reason>[^']+)'$"
+    ).unwrap();
 
     // TODO: how to make this optional?
     static ref CHAT_MAPGEN_START_REGEX: Regex = Regex::new(
@@ -327,6 +330,18 @@ impl LogParser {
             debug!("server join cid={}", cid);
             self.tracked_sessions[cid] =
                 Some(TrackedPlaySession::new(line.date_time, ip.to_string()));
+        } else if let Some(cap) = get_single_capture(&SERVER_RCON_BAN_REGEX, &line.message) {
+            // r"^ClientID=(?P<cid>\d+)\s+rcon='ban\s+(?P<cid_ban>\d+)\s+(?P<duration>\d+)\s+(?P<reason>[^']+)'$"
+            let _cid_user: usize = cap["cid"].parse::<usize>().unwrap();
+            let cid_ban: usize = cap["cid_ban"].parse::<usize>().unwrap();
+            let _duration: usize = cap["duration"].parse::<usize>().unwrap();
+            let _reason = &cap["reason"];
+
+            info!("BAN {}!", cid_ban);
+
+            let session = self.get_tracked_session(cid_ban);
+            session.end = Some(line.date_time);
+            self.finish_session(cid_ban);
         }
     }
 
