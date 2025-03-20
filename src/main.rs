@@ -22,7 +22,7 @@ lazy_static! {
         r"^player has entered the game\. ClientID=(?P<client_id>\d+)\s+addr=<\{(?P<ip>\[[^\]]+\]|[^:]+):(?P<port>\d+)\}>\s+sixup=(?P<sixup>[01])$"
     ).unwrap();
     static ref GAME_LEAVE_REGEX: Regex = Regex::new(
-        r"^leave player='(?P<cid>\d+):(?P<name>[^']+)'$"
+        r"^leave player='(?P<cid>\d+):(?P<name>.*)'$"
     ).unwrap();
     static ref CHAT_MESSAGE_REGEX: Regex = Regex::new(
         r"^(?P<cid>\d+):(?P<unknown>[^:]+):(?P<name>[^:]+): (?P<message>.*)$"
@@ -48,8 +48,11 @@ lazy_static! {
     ).unwrap();
 
     // TODO: how to make this optional?
-    static ref CHAT_MAPGEN_INFO_REGEX: Regex = Regex::new(
+    static ref CHAT_MAPGEN_START_REGEX: Regex = Regex::new(
         r#".*\[GEN\] Generating.*gen_cfg="(?P<gen_cfg>[^"]+)".*map_cfg="(?P<map_cfg>[^"]+)".*"#
+    ).unwrap();
+    static ref CHAT_MAPGEN_DONE_REGEX: Regex = Regex::new(
+        r"^\*\*\* \[GEN\] Done\.\.\.$"
     ).unwrap();
 }
 
@@ -139,12 +142,18 @@ impl TrackedPlaySession {
         }
     }
 
-    fn finalize(self) -> PlaySession {
+    fn finalize(self) -> Option<PlaySession> {
+        if self.version.is_none() {
+            return None; // we dont want to crash here as server may kick old versions..
+        }
+        let version = self.version.unwrap();
+
+        // however, we want to crash when these are not set
         let end = self.end.expect("end not set");
-        let player_name = self.player_name.expect("name not set");
         let duration = end - self.start;
-        let version = self.version.expect("version not set");
-        PlaySession {
+        let player_name = self.player_name.expect("name not set");
+
+        Some(PlaySession {
             start: self.start,
             end,
             duration,
@@ -154,7 +163,7 @@ impl TrackedPlaySession {
             finishes: self.finishes,
             version,
             timeout: self.timeout,
-        }
+        })
     }
 
     fn set_or_validate_name(&mut self, name: &str) {
@@ -164,19 +173,15 @@ impl TrackedPlaySession {
             }
 
             // allow name changes from "(1)name" -> "name"
-            // we also need to respect the maximum name limit..
-            if current_name.starts_with('(') {
-                if let Some(end) = current_name.find(')') {
-                    let player_name = current_name[end + 1..].trim();
-                    let prefix = &current_name[..end + 1];
-                    let allowed_length = NAME_LIMIT.saturating_sub(prefix.len());
-                    let truncated_player_name = &name[..allowed_length.min(name.len())];
-                    if player_name == truncated_player_name {
-                        self.player_name = Some(name.to_string());
-                        return;
-                    }
-                }
+            // allow name changes from "name" -> "(1)name"
+            if compare_sanitized_player_names(current_name, name) {
+                info!("implicit rename {} -> {}", current_name, name);
+                self.player_name = Some(name.to_string());
+                return;
             }
+
+            dbg!(sanitize_player_name(current_name));
+            dbg!(sanitize_player_name(name));
 
             warn!(
                 "Name mismatch: currently known name is '{}', now '{}'",
@@ -186,6 +191,25 @@ impl TrackedPlaySession {
 
         self.player_name = Some(name.to_string());
     }
+}
+
+fn sanitize_player_name(name: &str) -> String {
+    if name.starts_with('(') {
+        if let Some(end) = name.find(')') {
+            let base_name = name[end + 1..].trim();
+            let prefix = &name[..end + 1];
+            let allowed_length = NAME_LIMIT.saturating_sub(prefix.len());
+            return base_name.chars().take(allowed_length).collect();
+        }
+    }
+    name.to_string()
+}
+
+fn compare_sanitized_player_names(name_a: &str, name_b: &str) -> bool {
+    let san_a = sanitize_player_name(name_a);
+    let san_b = sanitize_player_name(name_b);
+    let min_len = san_a.chars().count().min(san_b.chars().count());
+    san_a.chars().take(min_len).eq(san_b.chars().take(min_len))
 }
 
 #[derive(Debug)]
@@ -275,12 +299,16 @@ impl LogParser {
             // this can for example happen on map change. In this case we check if the IPs match.
             if let Some(tracked_session) = &mut self.tracked_sessions[cid] {
                 // first we ensure that tracked connection is not actively connected
-                assert!(!tracked_session.connected);
+                assert!(
+                    !tracked_session.connected,
+                    "cid={} is already tracked AND connected?",
+                    cid
+                );
 
                 // then we check if IPs match, if yes we interpret the server join as a re-join and
                 // continue the tracked session for this CID
                 if tracked_session.client_ip == ip {
-                    debug!("re-join cid={}", cid);
+                    debug!("server re-join cid={}", cid);
                     tracked_session.connected = true;
                     tracked_session.end = None; // reset end datetime, as player reconnected
                     return; // skip the following
@@ -294,7 +322,7 @@ impl LogParser {
             }
 
             // new CID -> start new session!
-            debug!("join cid={}", cid);
+            debug!("server join cid={}", cid);
             self.tracked_sessions[cid] =
                 Some(TrackedPlaySession::new(line.date_time, ip.to_string()));
         }
@@ -306,7 +334,7 @@ impl LogParser {
             let cid: usize = cap["cid"].parse::<usize>().unwrap();
             let name = &cap["name"];
 
-            debug!("leave cid={}", cid);
+            debug!("game leave cid={}", cid);
 
             // add end datetime to session and validate player name
             let session = self.get_tracked_session(cid);
@@ -336,7 +364,7 @@ impl LogParser {
             let secs = cap["seconds"].parse::<f32>().unwrap();
             let mins = cap["minutes"].parse::<f32>().unwrap();
 
-            let cid = self.get_cid(&name).unwrap();
+            let cid = self.get_cid_sanitized(&name).unwrap();
             let session = self.get_tracked_session(cid);
 
             let finish = Finish {
@@ -348,13 +376,28 @@ impl LogParser {
             let name = &cap["name"];
             let new_cid = self.last_join_cid.unwrap();
 
-            if let Some(old_cid) = self.get_cid(name) {
+            if let Some(old_cid) = self.get_cid_exact(name) {
                 // player name is already tracked for another cid. This can happen if a player
                 // re-connects while the server map changes. So a leave is never triggered.
                 // so we migrate old_cid -> new_cid
-                let old_session = self.tracked_sessions[old_cid].take();
-                self.tracked_sessions[new_cid] = old_session;
-                debug!("migrating {} -> {}", old_cid, new_cid);
+                let old_session = self.tracked_sessions[old_cid].as_ref().unwrap();
+
+                if new_cid == old_cid {
+                    // not actually any collision, make sure the name is set.
+                    self.tracked_sessions[old_cid]
+                        .as_mut()
+                        .unwrap()
+                        .set_or_validate_name(name);
+                    debug!(
+                        "repeated name join for cid={} with name='{}'",
+                        new_cid, name
+                    );
+                } else if !old_session.connected {
+                    self.tracked_sessions[new_cid] = self.tracked_sessions[old_cid].take();
+                    debug!("migrating {} -> {}", old_cid, new_cid);
+                } else {
+                    panic!("collision cids=[{},{}]", old_cid, new_cid);
+                }
             } else {
                 // current player name is not tracked yet so we use the previous
                 // server join message for determining the correct new CID.
@@ -365,22 +408,25 @@ impl LogParser {
         } else if let Some(cap) = get_single_capture(&CHAT_RENAME_REGEX, &line.message) {
             let old_name = &cap["old"];
             let new_name = &cap["new"];
-
-            let cid = self.get_cid(&old_name).unwrap();
+            debug!("rename {} -> {}", old_name, new_name);
+            let cid = self.get_cid_exact(&old_name).unwrap();
             let session = self.get_tracked_session(cid);
             session.player_name = Some(new_name.to_string()); // overwrite! TODO: track all names?
         } else if let Some(cap) = get_single_capture(&CHAT_TIMEOUT_REGEX, &line.message) {
             let name = &cap["name"];
-            let cid = self.get_cid(&name).unwrap();
+            let cid = self.get_cid_exact(&name).unwrap();
+            debug!("timeout {} {}", cid, name);
+
             let session = self.get_tracked_session(cid);
             session.end = Some(line.date_time); // set end in case timeout never reconnects
             session.timeout = true;
-        } else if let Some(cap) = get_single_capture(&CHAT_MAPGEN_INFO_REGEX, &line.message) {
+        } else if let Some(cap) = get_single_capture(&CHAT_MAPGEN_START_REGEX, &line.message) {
             let gen_cfg = &cap["gen_cfg"];
             let map_cfg = &cap["map_cfg"];
-
-            // new map was generated (TODO: most likely... im not checking for "DONE" yet xd)
-
+            debug!("started gen {} {}", gen_cfg, map_cfg);
+        } else if let Some(cap) = get_single_capture(&CHAT_MAPGEN_DONE_REGEX, &line.message) {
+            debug!("gen success");
+            // new map was generated
             for cid in 0..MAX_PLAYERS {
                 if let Some(tracked_session) = &mut self.tracked_sessions[cid] {
                     // set all connections to not connected, remember end datetime
@@ -433,18 +479,20 @@ impl LogParser {
 
     fn finish_session(&mut self, cid: usize) {
         let tracked_session = self.tracked_sessions[cid].take().unwrap();
-        let session = tracked_session.finalize();
 
-        // TODO: clean player prefixes
-        if !self.sessions.contains_key(&session.player_name) {
+        if let Some(session) = tracked_session.finalize() {
+            // TODO: clean player prefixes
+            if !self.sessions.contains_key(&session.player_name) {
+                self.sessions
+                    .insert(session.player_name.to_owned(), Vec::new());
+            }
             self.sessions
-                .insert(session.player_name.to_owned(), Vec::new());
+                .get_mut(&session.player_name)
+                .unwrap()
+                .push(session);
+        } else {
+            warn!("session couldnt be finalized");
         }
-
-        self.sessions
-            .get_mut(&session.player_name)
-            .unwrap()
-            .push(session);
     }
 
     fn get_tracked_session(&mut self, cid: usize) -> &mut TrackedPlaySession {
@@ -455,7 +503,18 @@ impl LogParser {
         session
     }
 
-    fn get_cid(&self, player_name: &str) -> Option<usize> {
+    fn get_cid_sanitized(&self, player_name: &str) -> Option<usize> {
+        self.tracked_sessions.iter().position(|tracked_session| {
+            tracked_session.as_ref().map_or(false, |s| {
+                s.player_name
+                    .as_ref()
+                    .map_or(false, |n| compare_sanitized_player_names(player_name, n))
+            })
+        })
+        // .expect(&format!("No tracked session found for '{}'", player_name))
+    }
+
+    fn get_cid_exact(&self, player_name: &str) -> Option<usize> {
         self.tracked_sessions.iter().position(|tracked_session| {
             tracked_session.as_ref().map_or(false, |s| {
                 s.player_name.as_ref().map_or(false, |n| n == player_name)
