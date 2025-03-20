@@ -119,7 +119,7 @@ struct TrackedPlaySession {
 struct PlaySession {
     start: NaiveDateTime,
     end: NaiveDateTime,
-    duration: TimeDelta,
+    duration: usize,
     player_name: String,
     client_ip: String,
     chat_messages: Vec<String>,
@@ -151,7 +151,7 @@ impl TrackedPlaySession {
 
         // however, we want to crash when these are not set
         let end = self.end.expect("end not set");
-        let duration = end - self.start;
+        let duration = (end - self.start).num_seconds() as usize;
         let player_name = self.player_name.expect("name not set");
 
         Some(PlaySession {
@@ -216,7 +216,8 @@ fn compare_sanitized_player_names(name_a: &str, name_b: &str) -> bool {
 #[derive(Serialize, Deserialize, Debug)]
 struct Finish {
     // map_name: String,
-    finish_time: Duration,
+    /// finish time in seconds
+    finish_time: f32,
 }
 
 #[derive(Debug)]
@@ -369,7 +370,7 @@ impl LogParser {
             let session = self.get_tracked_session(cid);
 
             let finish = Finish {
-                finish_time: Duration::from_secs_f32((mins * 60.0) + secs),
+                finish_time: (mins * 60.) + secs,
             };
 
             session.finishes.push(finish);
