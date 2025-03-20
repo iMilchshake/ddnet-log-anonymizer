@@ -3,6 +3,7 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -114,7 +115,7 @@ struct TrackedPlaySession {
     connected: bool,
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct PlaySession {
     start: NaiveDateTime,
     end: NaiveDateTime,
@@ -212,7 +213,7 @@ fn compare_sanitized_player_names(name_a: &str, name_b: &str) -> bool {
     san_a.chars().take(min_len).eq(san_b.chars().take(min_len))
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Finish {
     // map_name: String,
     finish_time: Duration,
@@ -524,6 +525,19 @@ impl LogParser {
     }
 }
 
+fn dump_sessions(sessions: &HashMap<String, Vec<PlaySession>>, output_path: &str) {
+    match File::create(output_path) {
+        Ok(file) => {
+            if let Err(e) = serde_json::to_writer_pretty(file, sessions) {
+                error!("Failed to write sessions json: {:?}", e);
+            } else {
+                info!("Sessions written to {}", output_path);
+            }
+        }
+        Err(e) => error!("Failed to create output file {}: {:?}", output_path, e),
+    }
+}
+
 fn main() -> std::io::Result<()> {
     env_logger::builder()
         .format_timestamp(None)
@@ -550,6 +564,7 @@ fn main() -> std::io::Result<()> {
             // dbg!(parser.sessions);
             dbg!(parser.tracked_sessions);
             error!("crashed D:");
+            dump_sessions(&parser.sessions, "./dump.json");
             panic::resume_unwind(err);
         }
     }
