@@ -35,13 +35,17 @@ lazy_static! {
         r"^cid=(?P<cid>\d+)\sversion=(?P<version>\d+)$"
     ).unwrap();
     static ref CHAT_JOIN_REGEX: Regex = Regex::new(
-        r"^\*\*\*\s'(?P<name>[^']+)' entered and joined the game$"
+        r"^\*\*\*\s'(?P<name>.*)' entered and joined the game$"
     ).unwrap();
     static ref CHAT_RENAME_REGEX: Regex = Regex::new(
-        r"^\*\*\*\s'(?P<old>[^']+)' changed name to '(?P<new>[^']+)'$"
+        r"^\*\*\*\s'(?P<old>.+)' changed name to '(?P<new>[^']+)'$"
     ).unwrap();
     static ref CHAT_TIMEOUT_REGEX: Regex = Regex::new(
-        r"^\*\*\*\s'(?P<name>[^']+)' would have timed out, but can use timeout protection now$"
+        r"^\*\*\*\s'(?P<name>.+)' would have timed out, but can use timeout protection now$"
+    ).unwrap();
+
+    static ref CHAT_TIMEOUT_USED_REGEX: Regex = Regex::new(
+        r"^\*\*\*\s'(?P<name>.+)'\s+has\s+left\s+the\s+game\s+\(Timeout Protection used\)$"
     ).unwrap();
 
     static ref ENGINE_SERVER_START_REGEX: Regex = Regex::new(
@@ -103,7 +107,7 @@ struct Player {
     sessions: Vec<TrackedPlaySession>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TrackedPlaySession {
     start: NaiveDateTime,
     end: Option<NaiveDateTime>,
@@ -216,7 +220,7 @@ fn compare_sanitized_player_names(name_a: &str, name_b: &str) -> bool {
     san_a.chars().take(min_len).eq(san_b.chars().take(min_len))
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Finish {
     // map_name: String,
     /// finish time in seconds
@@ -381,6 +385,8 @@ impl LogParser {
             let secs = cap["seconds"].parse::<f32>().unwrap();
             let mins = cap["minutes"].parse::<f32>().unwrap();
 
+            debug!("finish name={}", name);
+
             let cid = self.get_cid_sanitized(&name).unwrap();
             let session = self.get_tracked_session(cid);
 
@@ -392,6 +398,8 @@ impl LogParser {
         } else if let Some(cap) = get_single_capture(&CHAT_JOIN_REGEX, &line.message) {
             let name = &cap["name"];
             let new_cid = self.last_join_cid.unwrap();
+
+            debug!("name join -> {}", name);
 
             if let Some(old_cid) = self.get_cid_exact(name) {
                 // player name is already tracked for another cid. This can happen if a player
@@ -457,6 +465,40 @@ impl LogParser {
                     }
                 }
             }
+        } else if let Some(cap) = get_single_capture(&CHAT_TIMEOUT_USED_REGEX, &line.message) {
+            // from my observation a player name with prefix e.g. (1) uses the timeout, continuing
+            // to play with a CID which has same name but without prefix. This might not be perfect
+            let new_name = &cap["name"];
+            // FIXME: aaahhh this doesnt consider cases in which the name is cut-off....
+            // and i cant use get_cid_sanitized as it will match with the exact match instead lol.
+            let old_name = sanitize_player_name(new_name);
+
+            info!("timeout used. rename {} -> {}", &new_name, &old_name);
+
+            // FIXME: if name doesnt match try to match via IP..
+            // if that doesnt work check if there is only one valid option..
+            // if that doesnt work, omit.
+
+            // we get old and new cid based on names
+            let new_cid = self.get_cid_exact(new_name).unwrap();
+            let old_cid = self.get_cid_exact(&old_name).unwrap();
+
+            info!("timeout used. moving {} -> {}", &new_cid, &old_cid);
+
+            // rename new session to old name
+            let mut new_session = self.tracked_sessions[new_cid].take().unwrap();
+            let old_session = self.get_tracked_session(old_cid);
+            assert!(old_session.timeout); // make sure old session is actually timeouted
+            new_session.player_name = old_session.player_name.clone();
+
+            // finalize old session, without setting end, as it should already have been set
+            self.finish_session(old_cid);
+
+            // then we copy new session to CID of old session
+            // but we also keep new session for the new cid as a game leave message follows that
+            // will expect there to be a session to drop. TODO: add flag to not store this?
+            self.tracked_sessions[old_cid] = Some(new_session.clone());
+            self.tracked_sessions[new_cid] = Some(new_session);
         }
     }
 
